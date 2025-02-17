@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { videoStorage, StoredVideo } from './services/VideoStorage'
 
 interface VideoFormat {
   format_id: string;
@@ -22,14 +23,29 @@ function App() {
   const [error, setError] = useState('')
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null)
   const [selectedFormat, setSelectedFormat] = useState<string>('')
-  const [startTime, setStartTime] = useState(17)
-  const [endTime, setEndTime] = useState(27)
+  const [startTime, setStartTime] = useState(0)
+  const [endTime, setEndTime] = useState(10)
   const [acceptedDisclaimer, setAcceptedDisclaimer] = useState(false)
+  const [storedVideos, setStoredVideos] = useState<StoredVideo[]>([])
   const [previewUrl, setPreviewUrl] = useState<string>('')
   const videoRef = useRef<HTMLVideoElement>(null)
   const timelineRef = useRef<HTMLDivElement>(null)
   const [isDragging, setIsDragging] = useState<'start' | 'end' | null>(null)
   const [thumbnails, setThumbnails] = useState<string[]>([])
+
+  // Load stored videos on mount
+  useEffect(() => {
+    const loadStoredVideos = async () => {
+      const videos = await videoStorage.getAllVideos();
+      setStoredVideos(videos);
+    };
+    loadStoredVideos();
+    
+    // Run cleanup periodically
+    const cleanup = () => videoStorage.cleanup();
+    const interval = setInterval(cleanup, 60 * 60 * 1000); // Every hour
+    return () => clearInterval(interval);
+  }, []);
 
   const handleGetFormats = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -38,56 +54,105 @@ function App() {
     setVideoInfo(null)
     setPreviewUrl('')
     setThumbnails([])
+    setSelectedFormat('')  // Reset selected format
 
     try {
-      console.log('Fetching formats...')
+      // Check if video is already stored
+      const existingVideo = await videoStorage.getVideo(url);
+      if (existingVideo) {
+        setThumbnails(existingVideo.thumbnails || []);
+        // Set video info from stored data
+        setVideoInfo({
+          title: existingVideo.title,
+          duration: existingVideo.duration,
+          formats: [] // We don't store formats for cached videos
+        });
+        // Create preview URL from stored blob
+        const previewObjectUrl = URL.createObjectURL(existingVideo.blob);
+        setPreviewUrl(previewObjectUrl);
+        setLoading(false);
+        return;
+      }
+
+      // Get formats from API
       const formatsResponse = await fetch('http://localhost:8000/formats', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ url }),
-      })
+      });
 
       if (!formatsResponse.ok) {
-        throw new Error('Failed to get video formats')
+        throw new Error('Failed to get video formats');
       }
 
-      const data = await formatsResponse.json()
-      console.log('Got formats:', data)
-      setVideoInfo(data)
+      const data = await formatsResponse.json();
+      console.log('Received formats:', data.formats);
       
-      const formats = data.formats.filter((f: VideoFormat) => f.has_audio)
-      if (formats.length > 0) {
-        setSelectedFormat(formats[0].format_id)
-      }
-
-      console.log('Fetching thumbnails...')
-      const thumbnailsResponse = await fetch('http://localhost:8000/thumbnails', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ url }),
-      })
-
-      if (thumbnailsResponse.ok) {
-        const thumbnailData = await thumbnailsResponse.json()
-        console.log('Got thumbnails:', thumbnailData.thumbnails.length)
-        setThumbnails(thumbnailData.thumbnails)
-      } else {
-        console.error('Failed to get thumbnails:', await thumbnailsResponse.text())
-      }
+      // Filter formats to only include those with audio
+      const formatsWithAudio = data.formats.filter((format: VideoFormat) => format.has_audio);
+      console.log('Formats with audio:', formatsWithAudio);
       
-      setStartTime(17)
-      setEndTime(27)
+      setVideoInfo({
+        ...data,
+        formats: formatsWithAudio
+      });
+      
+      // Set the first format with audio as default
+      if (formatsWithAudio.length > 0) {
+        setSelectedFormat(formatsWithAudio[0].format_id);
+        
+        // Download the video immediately for preview
+        const downloadRequest = {
+          url: url,
+          format_id: formatsWithAudio[0].format_id
+        };
+        
+        const response = await fetch('http://localhost:8000/download', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(downloadRequest),
+        });
+
+        if (!response.ok) {
+          throw new Error('Failed to get video preview');
+        }
+
+        // Get video blob from response
+        const videoBlob = await response.blob();
+        
+        // Generate thumbnails
+        const newThumbnails = await videoStorage.generateThumbnails(videoBlob);
+        setThumbnails(newThumbnails);
+
+        // Create preview URL from blob
+        const previewObjectUrl = URL.createObjectURL(videoBlob);
+        setPreviewUrl(previewObjectUrl);
+
+        // Store video
+        const newStoredVideo: StoredVideo = {
+          url,
+          title: data.title,
+          blob: videoBlob,
+          timestamp: Date.now(),
+          duration: data.duration,
+          thumbnails: newThumbnails
+        };
+
+        await videoStorage.storeVideo(newStoredVideo);
+        setStoredVideos(await videoStorage.getAllVideos());
+      }
+
     } catch (err) {
-      console.error('Error:', err)
-      setError(err instanceof Error ? err.message : 'An error occurred')
+      console.error('Error:', err);
+      setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }
+  };
 
   const handleTimeUpdate = () => {
     if (videoRef.current) {
@@ -121,44 +186,76 @@ function App() {
   }
 
   const handleDownload = async () => {
-    if (!selectedFormat || !acceptedDisclaimer) return
+    if (!selectedFormat || !acceptedDisclaimer || !videoInfo) return;
     
-    setLoading(true)
-    setError('')
+    setLoading(true);
+    setError('');
 
     try {
-      const response = await fetch('http://localhost:8000/download', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ 
-          url, 
-          format_id: selectedFormat,
-          start_time: startTime,
-          end_time: endTime
-        }),
-      })
-
-      if (!response.ok) {
-        throw new Error('Failed to download video')
+      // Get stored video
+      const existingVideo = await videoStorage.getVideo(url);
+      if (!existingVideo) {
+        throw new Error('Video not found in storage');
       }
 
-      const blob = await response.blob()
-      const downloadUrl = window.URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = downloadUrl
-      a.download = 'video_clip.mp4'
-      document.body.appendChild(a)
-      a.click()
-      window.URL.revokeObjectURL(downloadUrl)
-      document.body.removeChild(a)
+      // Generate clip from stored video
+      await handleCreateClip(existingVideo);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred')
+      console.error('Download error:', err);
+      setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }
+  };
+
+  const handleCreateClip = async (video: StoredVideo) => {
+    try {
+      // Create form data
+      const formData = new FormData();
+      formData.append('video', video.blob);
+      formData.append('start_time', startTime.toString());
+      formData.append('end_time', endTime.toString());
+
+      // Process clip
+      const clipResponse = await fetch('http://localhost:8000/process-clip', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!clipResponse.ok) {
+        throw new Error('Failed to process clip');
+      }
+
+      // Download the processed clip
+      const clipBlob = await clipResponse.blob();
+      const clipUrl = URL.createObjectURL(clipBlob);
+      
+      // Trigger download
+      const a = document.createElement('a');
+      a.href = clipUrl;
+      a.download = `${video.title}_clip.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(clipUrl);
+
+    } catch (err) {
+      throw new Error('Failed to create clip: ' + (err instanceof Error ? err.message : String(err)));
+    }
+  };
+
+  const handleDeleteVideo = async (videoUrl: string) => {
+    try {
+      await videoStorage.deleteVideo(videoUrl);
+      setStoredVideos(await videoStorage.getAllVideos());
+      if (url === videoUrl) {
+        setThumbnails([]);
+        setVideoInfo(null);
+      }
+    } catch (err) {
+      setError('Failed to delete video');
+    }
+  };
 
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60)
@@ -198,6 +295,75 @@ function App() {
     return () => document.removeEventListener('mouseup', handleMouseUp)
   }, [])
 
+  // Add cleanup for object URLs
+  useEffect(() => {
+    return () => {
+      if (previewUrl) {
+        URL.revokeObjectURL(previewUrl);
+      }
+    };
+  }, [previewUrl]);
+
+  // Add this new function near the other handlers
+  const handleUseStoredVideo = async (videoUrl: string) => {
+    setUrl(videoUrl);
+    setLoading(true);
+    setError('');
+    setVideoInfo(null);
+    setPreviewUrl('');
+    setThumbnails([]);
+    setSelectedFormat('');
+
+    try {
+      const existingVideo = await videoStorage.getVideo(videoUrl);
+      if (existingVideo) {
+        setThumbnails(existingVideo.thumbnails || []);
+        setVideoInfo({
+          title: existingVideo.title,
+          duration: existingVideo.duration,
+          formats: [] // We don't store formats for cached videos
+        });
+        const previewObjectUrl = URL.createObjectURL(existingVideo.blob);
+        setPreviewUrl(previewObjectUrl);
+      } else {
+        // If not in storage, fetch formats
+        const formatsResponse = await fetch('http://localhost:8000/formats', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ url: videoUrl }),
+        });
+
+        if (!formatsResponse.ok) {
+          throw new Error('Failed to get video formats');
+        }
+
+        const data = await formatsResponse.json();
+        console.log('Received formats:', data.formats);
+        
+        // Filter formats to only include those with audio
+        const formatsWithAudio = data.formats.filter((format: VideoFormat) => format.has_audio);
+        console.log('Formats with audio:', formatsWithAudio);
+        
+        setVideoInfo({
+          ...data,
+          formats: formatsWithAudio
+        });
+        
+        // Set the first format with audio as default
+        if (formatsWithAudio.length > 0) {
+          setSelectedFormat(formatsWithAudio[0].format_id);
+        }
+      }
+    } catch (err) {
+      console.error('Error:', err);
+      setError(err instanceof Error ? err.message : 'An error occurred');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="h-screen w-screen flex bg-gradient-to-b from-gray-900 to-gray-800">
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-3">
@@ -234,8 +400,37 @@ function App() {
               </div>
             </div>
 
+            {/* Stored Videos */}
+            <div className="mb-6">
+              <h2 className="text-xl font-semibold text-gray-800 mb-4">Stored Videos</h2>
+              <div className="space-y-4">
+                {storedVideos.map(video => (
+                  <div key={video.url} className="bg-white p-4 rounded-lg shadow">
+                    <h3 className="font-medium text-gray-900">{video.title}</h3>
+                    <p className="text-sm text-gray-500">
+                      {new Date(video.timestamp).toLocaleDateString()}
+                    </p>
+                    <div className="mt-2 flex space-x-2">
+                      <button
+                        onClick={() => handleUseStoredVideo(video.url)}
+                        className="text-blue-600 hover:text-blue-800 text-sm"
+                      >
+                        Use
+                      </button>
+                      <button
+                        onClick={() => handleDeleteVideo(video.url)}
+                        className="text-red-600 hover:text-red-800 text-sm"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
             <form onSubmit={handleGetFormats} className="space-y-4 mb-6">
-              <div>
+      <div>
                 <input
                   type="text"
                   value={url}
@@ -286,17 +481,17 @@ function App() {
                     onChange={(e) => setSelectedFormat(e.target.value)}
                     className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500"
                   >
+                    <option value="">Select a format</option>
                     {videoInfo.formats.map((format) => (
                       <option 
                         key={format.format_id} 
                         value={format.format_id}
-                        className={format.has_audio ? 'text-black' : 'text-gray-500'}
                       >
                         {format.quality}
                       </option>
                     ))}
                   </select>
-                </div>
+      </div>
 
                 <button
                   onClick={handleDownload}
@@ -306,7 +501,7 @@ function App() {
                   }`}
                 >
                   {loading ? 'Downloading...' : 'Download Clip'}
-                </button>
+        </button>
               </div>
             )}
 
@@ -328,24 +523,20 @@ function App() {
                   <video
                     ref={videoRef}
                     src={previewUrl}
-                    className="absolute w-full h-full object-contain"
+                    className="w-full h-full object-contain"
                     onTimeUpdate={handleTimeUpdate}
                     controls
                     controlsList="nodownload"
                     playsInline
                     onLoadedData={() => {
                       if (videoRef.current) {
-                        videoRef.current.currentTime = startTime
-                        videoRef.current.play().catch(err => {
-                          console.error('Failed to play video:', err)
-                          setError('Failed to play video. Please try again.')
-                        })
+                        videoRef.current.currentTime = startTime;
                       }
                     }}
                     onError={(e) => {
-                      console.error('Video error:', e)
-                      setError('Failed to load video preview')
-                      setPreviewUrl('')
+                      console.error('Video error:', e);
+                      setError('Failed to load video preview');
+                      setPreviewUrl('');
                     }}
                   />
                 </div>
@@ -362,51 +553,34 @@ function App() {
                         backgroundImage: `url(${thumbnails[Math.floor(thumbnails.length / 2)]})`,
                       }}
                       onClick={async () => {
-                        if (videoInfo) {
-                          try {
-                            setLoading(true)
-                            setError('')
-                            
-                            // The video should already be cached from thumbnails generation
-                            const response = await fetch('http://localhost:8000/preview', {
-                              method: 'POST',
-                              headers: {
-                                'Content-Type': 'application/json',
-                              },
-                              body: JSON.stringify({ url }),
-                            })
-                            
-                            if (!response.ok) {
-                              const errorText = await response.text()
-                              throw new Error(errorText)
-                            }
-                            
-                            const blob = await response.blob()
-                            const videoUrl = URL.createObjectURL(blob)
-                            setPreviewUrl(videoUrl)
-                          } catch (err) {
-                            console.error('Preview error:', err)
-                            setError(err instanceof Error ? err.message : 'Failed to load video preview')
-                            setPreviewUrl('')
-                          } finally {
-                            setLoading(false)
+                        try {
+                          setLoading(true);
+                          setError('');
+                          
+                          // Get video from storage
+                          const storedVideo = await videoStorage.getVideo(url);
+                          if (!storedVideo) {
+                            throw new Error('Video not found in storage');
                           }
+                          
+                          // Create preview URL from stored blob
+                          const videoUrl = URL.createObjectURL(storedVideo.blob);
+                          setPreviewUrl(videoUrl);
+                        } catch (err) {
+                          console.error('Preview error:', err);
+                          setError(err instanceof Error ? err.message : 'Failed to load video preview');
+                        } finally {
+                          setLoading(false);
                         }
                       }}
                     >
                       <div className="absolute inset-0 flex items-center justify-center bg-black/30 group-hover:bg-black/40 transition-colors">
-                        {loading ? (
-                          <div className="text-lg text-white font-medium px-6 py-3 rounded-lg bg-black/70 backdrop-blur-sm">
-                            Loading video...
-                          </div>
-                        ) : (
-                          <div className="w-20 h-20 rounded-full bg-black/50 flex items-center justify-center group-hover:scale-110 transition-transform">
-                            <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                            </svg>
-                          </div>
-                        )}
+                        <div className="w-20 h-20 rounded-full bg-black/50 flex items-center justify-center group-hover:scale-110 transition-transform">
+                          <svg xmlns="http://www.w3.org/2000/svg" className="h-12 w-12 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                          </svg>
+                        </div>
                       </div>
                     </div>
                   ) : (
