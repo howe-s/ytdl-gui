@@ -82,30 +82,26 @@ async def get_formats(video: VideoURL):
             
             # Get video duration
             duration = info.get('duration', 0)
+            logger.info(f"Video duration: {duration} seconds")
             
             # Filter and format the available formats
             formats = []
             seen_qualities = set()
             
+            # Only collect formats that have both video and audio built-in
             for fmt in info['formats']:
-                # Skip formats that are known to be problematic
-                if fmt.get('format_note') == 'storyboard':
-                    continue
-
-                # Get format details
-                height = fmt.get('height', 0)
-                width = fmt.get('width', 0)
-                ext = fmt.get('ext', 'unknown')
-                vcodec = fmt.get('vcodec', 'none')
-                acodec = fmt.get('acodec', 'none')
-                
-                # Skip formats without video or audio
-                if vcodec == 'none' or acodec == 'none':
-                    continue
-                
-                # Create a quality key for deduplication
-                quality = fmt.get('format_note', 'unknown')
-                if height:  # If height is available, use it for quality label
+                if fmt.get('acodec', 'none') != 'none' and fmt.get('vcodec', 'none') != 'none':
+                    height = fmt.get('height', 0)
+                    width = fmt.get('width', 0)
+                    ext = fmt.get('ext', 'unknown')
+                    quality_key = f"{height}p_{ext}"
+                    
+                    if quality_key in seen_qualities or not height:
+                        continue
+                    
+                    seen_qualities.add(quality_key)
+                    
+                    # Create quality label
                     if height >= 2160:
                         quality = "4K"
                     elif height >= 1440:
@@ -122,25 +118,20 @@ async def get_formats(video: VideoURL):
                         quality = "240p"
                     else:
                         quality = f"{height}p"
-                
-                # Include codec info in the quality label
-                quality_key = f"{quality}_{ext}"
-                
-                format_info = {
-                    'format_id': fmt['format_id'],
-                    'quality': f"{quality} ({ext})",
-                    'ext': ext,
-                    'filesize': fmt.get('filesize', 'unknown'),
-                    'resolution': f"{width}x{height}" if width and height else 'unknown',
-                    'has_audio': True  # We only include formats with audio now
-                }
-                
-                formats.append(format_info)
-                logger.info(f"Added format: {format_info}")
-            
-            # Sort formats by resolution (if available) and then by filesize
+                    
+                    quality_label = f"{quality} ({ext})"
+                    
+                    formats.append({
+                        'format_id': fmt['format_id'],
+                        'quality': quality_label,
+                        'ext': ext,
+                        'filesize': fmt.get('filesize', 'unknown'),
+                        'resolution': f"{width}x{height}",
+                        'has_audio': True
+                    })
+
+            # Sort formats by resolution (height) and then by filesize
             def sort_key(x):
-                # Get height from resolution
                 height = 0
                 if x['resolution'] != 'unknown':
                     try:
@@ -148,7 +139,6 @@ async def get_formats(video: VideoURL):
                     except (IndexError, ValueError):
                         pass
 
-                # Get filesize, using -1 for unknown/None values
                 filesize = -1
                 if x['filesize'] not in ('unknown', None):
                     try:
@@ -156,7 +146,7 @@ async def get_formats(video: VideoURL):
                     except (TypeError, ValueError):
                         pass
 
-                return (height, -filesize)  # Negative filesize to sort largest first
+                return (height, -filesize)
 
             formats.sort(key=sort_key, reverse=True)
             
@@ -201,15 +191,17 @@ async def download_video(request: VideoDownloadRequest):
                     raise HTTPException(status_code=400, detail="Selected format not found")
                 
                 logger.info(f"Found format, streaming video")
-                
-                # Download and stream the video
                 video_data = await stream_video(selected_format['url'])
+                
+                # Get safe filename
+                title = info.get('title', 'video').replace('/', '_').replace('\\', '_')
+                filename = f"{title}.{selected_format.get('ext', 'mp4')}"
                 
                 return StreamingResponse(
                     iter([video_data]),
                     media_type="video/mp4",
                     headers={
-                        "Content-Disposition": f'attachment; filename="{info.get("title", "video")}.mp4"',
+                        "Content-Disposition": f'attachment; filename="{filename}"',
                         "Content-Length": str(len(video_data))
                     }
                 )

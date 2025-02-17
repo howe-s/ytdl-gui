@@ -61,13 +61,11 @@ function App() {
       const existingVideo = await videoStorage.getVideo(url);
       if (existingVideo) {
         setThumbnails(existingVideo.thumbnails || []);
-        // Set video info from stored data
         setVideoInfo({
           title: existingVideo.title,
           duration: existingVideo.duration,
           formats: [] // We don't store formats for cached videos
         });
-        // Create preview URL from stored blob
         const previewObjectUrl = URL.createObjectURL(existingVideo.blob);
         setPreviewUrl(previewObjectUrl);
         setLoading(false);
@@ -90,61 +88,65 @@ function App() {
       const data = await formatsResponse.json();
       console.log('Received formats:', data.formats);
       
-      // Filter formats to only include those with audio
-      const formatsWithAudio = data.formats.filter((format: VideoFormat) => format.has_audio);
-      console.log('Formats with audio:', formatsWithAudio);
+      // Find the first format that has audio for preview
+      const previewFormat = data.formats.find((format: VideoFormat) => format.has_audio);
       
+      if (!previewFormat) {
+        throw new Error('No suitable preview format found');
+      }
+      
+      // Set video info with all available formats for download
       setVideoInfo({
         ...data,
-        formats: formatsWithAudio
+        formats: data.formats
       });
       
-      // Set the first format with audio as default
-      if (formatsWithAudio.length > 0) {
-        setSelectedFormat(formatsWithAudio[0].format_id);
-        
-        // Download the video immediately for preview
-        const downloadRequest = {
-          url: url,
-          format_id: formatsWithAudio[0].format_id
-        };
-        
-        const response = await fetch('http://localhost:8000/download', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(downloadRequest),
-        });
-
-        if (!response.ok) {
-          throw new Error('Failed to get video preview');
-        }
-
-        // Get video blob from response
-        const videoBlob = await response.blob();
-        
-        // Generate thumbnails
-        const newThumbnails = await videoStorage.generateThumbnails(videoBlob);
-        setThumbnails(newThumbnails);
-
-        // Create preview URL from blob
-        const previewObjectUrl = URL.createObjectURL(videoBlob);
-        setPreviewUrl(previewObjectUrl);
-
-        // Store video
-        const newStoredVideo: StoredVideo = {
-          url,
-          title: data.title,
-          blob: videoBlob,
-          timestamp: Date.now(),
-          duration: data.duration,
-          thumbnails: newThumbnails
-        };
-
-        await videoStorage.storeVideo(newStoredVideo);
-        setStoredVideos(await videoStorage.getAllVideos());
+      // Set the first format as default selected format
+      if (data.formats.length > 0) {
+        setSelectedFormat(data.formats[0].format_id);
       }
+      
+      // Download the preview format immediately
+      const downloadRequest = {
+        url: url,
+        format_id: previewFormat.format_id
+      };
+      
+      const response = await fetch('http://localhost:8000/download', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(downloadRequest),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to get video preview');
+      }
+
+      // Get video blob from response
+      const videoBlob = await response.blob();
+      
+      // Generate thumbnails
+      const newThumbnails = await videoStorage.generateThumbnails(videoBlob);
+      setThumbnails(newThumbnails);
+
+      // Create preview URL from blob
+      const previewObjectUrl = URL.createObjectURL(videoBlob);
+      setPreviewUrl(previewObjectUrl);
+
+      // Store video
+      const newStoredVideo: StoredVideo = {
+        url,
+        title: data.title,
+        blob: videoBlob,
+        timestamp: Date.now(),
+        duration: data.duration,
+        thumbnails: newThumbnails
+      };
+
+      await videoStorage.storeVideo(newStoredVideo);
+      setStoredVideos(await videoStorage.getAllVideos());
 
     } catch (err) {
       console.error('Error:', err);
@@ -377,7 +379,7 @@ function App() {
             {/* Disclaimer */}
             <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 text-sm text-yellow-800 mb-6">
               <h2 className="font-bold mb-2">Fair Use Disclaimer</h2>
-              <p className="mb-2">This tool is intended for creating short clips (max 15 seconds) for:</p>
+              <p className="mb-2">This tool is intended for creating clips for:</p>
               <ul className="list-disc pl-5 mb-2">
                 <li>Commentary</li>
                 <li>Criticism</li>
